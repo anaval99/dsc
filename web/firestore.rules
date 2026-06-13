@@ -1,0 +1,67 @@
+rules_version = '2';
+
+// Damn Simple Cooking — Firestore security rules.
+//
+// Recipe CONTENT: public read; create/update only by the authed owner, and a
+// content write may never touch the denormalized stat fields.
+// STATS (ratings/adds subcollections + the stat counters): ALL client writes
+// are denied — they are written exclusively by the server via the Admin SDK,
+// which bypasses these rules. This is the anti-forgery guarantee from the plan.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // The three denormalized stat counters that content writers must not touch.
+    function statFields() {
+      return ['ratingSum', 'ratingCount', 'addCount'];
+    }
+
+    // True when the incoming write leaves every stat counter exactly as it was.
+    function statsUnchanged() {
+      return request.resource.data.ratingSum == resource.data.ratingSum
+        && request.resource.data.ratingCount == resource.data.ratingCount
+        && request.resource.data.addCount == resource.data.addCount;
+    }
+
+    function isValidNewRecipe() {
+      let d = request.resource.data;
+      return d.authorUid == request.auth.uid
+        && d.title is string && d.title.size() > 0
+        && d.ingredients is list && d.ingredients.size() > 0
+        && d.steps is list && d.steps.size() > 0
+        // Forks/creates must start their counters at zero; only the server moves them.
+        && d.ratingSum == 0 && d.ratingCount == 0 && d.addCount == 0;
+    }
+
+    match /recipes/{recipeId} {
+      // Public browse/read.
+      allow read: if true;
+
+      // Authenticated users create docs they own (covers create + fork).
+      allow create: if isSignedIn() && isValidNewRecipe();
+
+      // Only the owner may update, may not change ownership, and may not
+      // touch the stat counters (those are server-only).
+      allow update: if isSignedIn()
+        && resource.data.authorUid == request.auth.uid
+        && request.resource.data.authorUid == resource.data.authorUid
+        && statsUnchanged();
+
+      // Deleting recipes is out of scope for v1.
+      allow delete: if false;
+
+      // Stat marker docs are written only by the Admin SDK (server).
+      match /ratings/{ipKey} {
+        allow read: if false;
+        allow write: if false;
+      }
+      match /adds/{ipKey} {
+        allow read: if false;
+        allow write: if false;
+      }
+    }
+  }
+}

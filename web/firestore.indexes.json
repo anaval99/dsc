@@ -1,0 +1,11 @@
+{
+  "indexes": [
+    {
+      "comment": "Browse list: newest recipes first.",
+      "collectionGroup": "recipes",
+      "queryScope": "COLLECTION",
+      "fields": [{ "fieldPath": "updatedAt", "order": "DESCENDING" }]
+    }
+  ],
+  "fieldOverrides": []
+}
