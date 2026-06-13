@@ -36,6 +36,12 @@ Two deliverables in **one repo** (`dsc`), `/mobile` and `/web`:
 | Web read access | **Public** — browsing/reading requires no login. |
 | Web write access | **Login required (Google) to create, edit, or fork.** This is the anti-bot gate. |
 | Fork | Any signed-in user can **fork** any recipe: a new doc they own, seeded from the original, with **attribution** (`forkedFrom` + original title/author) shown on the recipe page. |
+| Recipe stats | Each recipe shows a **1–5 star rating** (average + count) and an **"Adds" count** (times "Add to Damn Simple Cooking" was clicked). **Web-only display.** |
+| Rating / Adds auth | **Anonymous** (no Google sign-in) — rating and adding are open to all visitors, since stats are low-stakes and meant to be frictionless. |
+| Spam dedup | **Best-effort only**, keyed on a **hashed public IP** (fetched via a free IP-echo API). One rating + one add recorded per IP. Explicitly **not** spam-proof or rule-enforceable (see §8); Anonymous-Auth hardening flagged in §11. |
+| Stats accuracy | **Approximate by design.** Shared IPs (CGNAT/household) over-count as one; rotating IPs/VPNs under-dedup. Accepted: "directionally useful," not exact. |
+| Stats aggregation | **Functions-free.** Denormalized `ratingSum`/`ratingCount`/`addCount` on the recipe doc, incremented client-side; averages computed in the browser. No Cloud Functions. |
+| Stats in app | **None.** The offline app never shows ratings/adds (it could never refresh them); stats live only on the web. |
 | Recipe shape | `title`, optional `description`, **one** `ingredients[]` list, **one or more** ordered `steps[]`. |
 | Ingredient row | `{ name, qty (rational, whole or fractional), unit }`. |
 | Unit input | Free-text **datalist**: common suggestions (cup, tsp, tbsp, g, ml, …) but users may type their own. |
@@ -72,6 +78,8 @@ Two deliverables in **one repo** (`dsc`), `/mobile` and `/web`:
 | Database | Firestore | Document model fits a recipe cleanly; public read rules, authed write rules. |
 | Hosting | Firebase Hosting (assumption) | Co-located with Auth/Firestore; clean App-Link domain association (`assetlinks.json`). |
 | Fraction formatting | Shared logic mirrored from the app's formatter (ported to TS) | Identical `½`/`1½` rendering on both sides. |
+| Stats backend | Firestore only — **no Cloud Functions**. Counters denormalized on the recipe doc; averages computed client-side. | Keeps the stack to Hosting + Auth + Firestore. |
+| IP dedup | A free **IP-echo API** (e.g. ipify) fetched client-side; the IP is **hashed** before use as a dedup key. | Best-effort one-per-IP; never stored raw (PII). Not enforceable in rules — see §8. |
 
 > **Account creation rule:** the plan never auto-creates accounts. Google sign-in is performed **by the user** in their own browser; the app never enters credentials.
 ---
@@ -143,19 +151,23 @@ web/src/
 ├── auth/
 │   └── useGoogleAuth.ts     # sign-in/out; the user clicks the Google button themselves
 ├── data/
-│   └── recipes.ts           # Firestore read (public) + create/update/fork (authed) helpers
+│   ├── recipes.ts           # Firestore read (public) + create/update/fork (authed) helpers
+│   └── stats.ts             # rate(recipeId, 1..5) + recordAdd(recipeId); dedup-marker writes + counter increments
 ├── lib/
 │   ├── rational.ts          # mirror of the app's Rational parse/format (½, 1½)
-│   └── recipeLink.ts        # build the "Add to Damn Simple Cooking" App Link (encode payload)
+│   ├── recipeLink.ts        # build the "Add to Damn Simple Cooking" App Link (encode payload)
+│   └── clientIp.ts          # fetch public IP via free IP-echo API, then hash -> dedup key (best-effort)
 ├── pages/
-│   ├── BrowsePage.tsx       # public list/search of recipes
-│   ├── RecipePage.tsx       # public view + "Add to DSC" + (authed) Edit-if-owner / Fork buttons + fork attribution
+│   ├── BrowsePage.tsx       # public list/search; cards show avg stars + Adds count
+│   ├── RecipePage.tsx       # public view + "Add to DSC" (records an Add) + star rating + (authed) Edit-if-owner / Fork + fork attribution
 │   └── RecipeFormPage.tsx   # auth-gated form (title, description, ingredients[], steps[]); serves create / edit / fork via seed + mode
 └── components/
     ├── RecipeCard.tsx
     ├── IngredientEditor.tsx # qty + unit (datalist) + name rows
     ├── StepEditor.tsx
-    └── ForkAttribution.tsx  # "Forked from <title> by <author>" link
+    ├── ForkAttribution.tsx  # "Forked from <title> by <author>" link
+    ├── StarRating.tsx       # read-only avg display + interactive 1–5 input (disabled once this IP has rated)
+    └── StatsBadge.tsx       # compact "★ 4.3 (12) · 87 adds" badge for cards
 ```
 
 **Data flow (web).** Browse/recipe pages read Firestore directly (public read rules). The form page requires an authed user (Google) and runs in three modes:
@@ -164,6 +176,13 @@ web/src/
 - **Fork** (`/r/:id/fork`): loads any recipe, seeds the form, and on submit writes a **new** doc owned by the forker carrying `forkedFrom`/`forkedFromTitle`/`forkedFromAuthor`. The original is untouched.
 
 The recipe page builds the App Link by encoding the recipe into the URL via `recipeLink.ts`, and renders `ForkAttribution` when `forkedFrom` is set.
+
+**Stats flow (web, anonymous).** Browse/recipe reads include the denormalized `ratingSum`/`ratingCount`/`addCount` fields, so display needs no extra reads. Writing a stat:
+1. `clientIp.ts` fetches the visitor's public IP from a free IP-echo API and hashes it → `ipKey` (best-effort; on API failure, fall back to a random/localStorage key so the UI still works).
+2. **Rate:** create `recipes/{id}/ratings/{ipKey}` `{ value: 1..5 }` and bump `ratingSum += value`, `ratingCount += 1` on the recipe doc (one transaction). The marker doc's existence disables the stars for that IP.
+3. **Add:** clicking "Add to DSC" creates `recipes/{id}/adds/{ipKey}` and bumps `addCount += 1`, then proceeds to the App Link. Re-clicks from the same IP don't re-count.
+
+Stats are **never shown in the app** — the offline app can't refresh them, so they stay web-only.
 ---
 
 ## 5. Domain model & the two tricky pieces
@@ -266,12 +285,25 @@ Three related tables; computed/scaled quantities are **never stored** (only `bas
 ```
 { title, description?, ingredients: [{name, qty:"3/2", unit}], steps: ["…"],
   authorUid, authorName, createdAt, updatedAt,
-  forkedFrom?, forkedFromTitle?, forkedFromAuthor? }   // present only on forks
+  forkedFrom?, forkedFromTitle?, forkedFromAuthor?,   // present only on forks
+  ratingSum, ratingCount, addCount }                  // stats (denormalized; default 0)
 ```
 
-- **Fork provenance:** a forked doc stores `forkedFrom` (the source `recipeId`) plus a denormalized `forkedFromTitle`/`forkedFromAuthor` snapshot so attribution renders even if the original is later changed. A fork is otherwise a normal doc owned by the forker, with its own `recipeId` (→ its own `sourceId` in the payload), so it never collides with the original on the app's `upsertBySourceId`.
-- **Security rules:** `read: if true` (public browse); `create/update: if request.auth != null && request.auth.uid == request.resource.data.authorUid` (only signed-in users, only their own docs — this covers create, edit, **and** fork uniformly, since a fork is just a create of a doc you own). Delete out of scope for v1 (and never performed automatically). **Rules are part of the deliverable**, version-controlled in `/web`.
-- `authorUid`/`authorName` come from the Google sign-in; never collected via a form.
+with two stat subcollections, keyed by hashed-IP (`ipKey`) for best-effort dedup:
+
+```
+recipes/{recipeId}/ratings/{ipKey}  { value: 1..5, createdAt }
+recipes/{recipeId}/adds/{ipKey}     { createdAt }
+```
+
+- **Fork provenance:** a forked doc stores `forkedFrom` (the source `recipeId`) plus a denormalized `forkedFromTitle`/`forkedFromAuthor` snapshot so attribution renders even if the original is later changed. A fork is otherwise a normal doc owned by the forker, with its own `recipeId` (→ its own `sourceId` in the payload), so it never collides with the original on the app's `upsertBySourceId`. Forks start with stats at `0`.
+- **Stats are denormalized:** `ratingSum`/`ratingCount`/`addCount` live on the recipe doc (display avg = `ratingSum/ratingCount`), incremented client-side in the same transaction as the marker-doc write. No Cloud Functions.
+- **Security rules:**
+  - Recipe content: `read: if true` (public browse); `create/update: if request.auth != null && request.auth.uid == request.resource.data.authorUid` — but a content update **must not change the stat fields**, and a stat update **must not change content** (field-level guards keep the two paths separate).
+  - Stats: rating/add **marker docs and the matching counter bumps are allowed *unauthenticated*** (stats are anonymous), shape-constrained — `ratings/{ipKey}.value ∈ 1..5`, marker `create`-only (no overwrite ⇒ one per `ipKey`), and the recipe-doc delta limited to `ratingCount +1` / `addCount +1` / `ratingSum += value`.
+  - **Caveat (documented, not solved):** because `ipKey` is supplied by the client, rules can enforce *shape* and *one-write-per-key* but **cannot verify the key is a real, unique IP**. This is best-effort anti-spam, not a guarantee — see §8 and §11.
+  - Delete out of scope for v1 (and never performed automatically). **Rules are part of the deliverable**, version-controlled in `/web`.
+- `authorUid`/`authorName` come from the Google sign-in; never collected via a form. Stats carry **no** author/PII — only a hashed IP key.
 ---
 
 ## 7. UI / UX design direction
@@ -285,8 +317,8 @@ Use the `/frontend-design:frontend-design` skill on both surfaces to keep them d
 - **Accessibility:** large tap targets; the slider exposes its current ×N as text; fractions have semantic labels.
 
 **Web — browse, recipe, and a single auth-gated form (create / edit / fork).**
-- **Browse (`/`):** public, searchable grid/list of recipe cards.
-- **Recipe (`/r/:id`):** public read view + a prominent **"Add to Damn Simple Cooking"** button (the App Link). Shows fractions identically to the app. When signed in, also shows **Fork** (any recipe) and **Edit** (only if you're the owner). If the recipe is a fork, a **"Forked from <title> by <author>"** line links to the original.
+- **Browse (`/`):** public, searchable grid/list of recipe cards, each showing a compact `StatsBadge` (avg stars + count, and Adds count).
+- **Recipe (`/r/:id`):** public read view + a prominent **"Add to Damn Simple Cooking"** button (the App Link; clicking it also records an Add). Shows fractions identically to the app, plus an interactive **1–5 `StarRating`** (no sign-in needed; the stars disable once this IP has rated) and the **average + Adds count**. When signed in, also shows **Fork** (any recipe) and **Edit** (only if you're the owner). If the recipe is a fork, a **"Forked from <title> by <author>"** line links to the original.
 - **Form (`/new`, `/r/:id/edit`, `/r/:id/fork`):** **auth-gated.** A clear "Sign in with Google" button (the user clicks it themselves). One form serves all three modes — title, description, ingredient rows (qty + unit datalist + name), step blocks — seeded empty (create), from the owned doc (edit), or from any recipe (fork). Fork mode shows the attribution it will record.
 
 ---
@@ -303,14 +335,17 @@ Use the `/frontend-design:frontend-design` skill on both surfaces to keep them d
 - **Deep-link decoding is total/non-throwing.** Malformed/oversized/unknown-version payloads → logged + snackbar, never crash. Unknown `v` is forward-safe.
 - **Dedupe by `sourceId`.** `sourceId` is always present (every recipe comes from the web); re-adding the same web recipe updates the local copy.
 - **App is offline.** No network calls in `/mobile`. The App-Link payload is self-contained.
-- **Web write gate.** Uploads require Google auth; reads are public. Enforced in Firestore rules, not just UI.
-- **No auto-account / no auto-auth / no auto-share.** Sign-in and any sharing are user-initiated in the browser.
+- **Web write gate.** Creating/editing/forking recipe *content* requires Google auth; reads are public. Enforced in Firestore rules, not just UI.
+- **Stats are anonymous and best-effort.** Rating and Adds need no sign-in. Dedup is keyed on a hashed public IP fetched from a free IP-echo API. This is **explicitly not spam-proof**: the IP is client-supplied (rules can enforce shape and one-write-per-key but not that the key is a genuine unique IP), shared IPs (CGNAT/household) collapse many users into one vote, and rotating IPs/VPNs allow repeats. Numbers are "directionally useful," never exact.
+- **Stats can't corrupt recipes.** Field-level rules keep the anonymous stat path (counters + marker docs) strictly separate from the authed content path — an anonymous writer can bump counters but can never touch `title`/`ingredients`/`steps`/`author*`.
+- **Stats never reach the app.** The offline app shows no ratings/adds (it could never refresh them); the App-Link payload carries recipe content only, no stats.
+- **No auto-account / no auto-auth / no auto-share.** Sign-in and any sharing are user-initiated in the browser. Stats writes store no PII (hashed IP only).
 - **Unit is free text** (datalist suggestions are hints, not a closed set). Empty unit allowed (e.g. "2 eggs").
 ---
 
 ## 9. Build phases & milestones
 
-Each phase is independently runnable/testable. **App v1 = Phases 1–6; Web v1 = Phases W1–W3.** They can proceed in parallel after the shared rational spec (Phase 1) is frozen.
+Each phase is independently runnable/testable. **App v1 = Phases 1–6; Web v1 = Phases W1–W4.** They can proceed in parallel after the shared rational spec (Phase 1) is frozen.
 
 ### App
 | Phase | Deliverable | Key tests |
@@ -330,6 +365,7 @@ Each phase is independently runnable/testable. **App v1 = Phases 1–6; Web v1 =
 | **W1. Browse + read** | `BrowsePage` (public list/search) + `RecipePage` (public view + fork attribution when present), reading Firestore. | render from fixture docs; fraction parity; attribution renders on forked doc |
 | **W2. Auth + create / edit / fork** | Google sign-in; auth-gated `RecipeFormPage` in three modes — **create** (`/new`), **edit own** (`/r/:id/edit`, owner-only), **fork any** (`/r/:id/fork`, writes new owned doc + `forkedFrom*`); Fork/Edit buttons on `RecipePage`; Firestore create/update; **security rules** committed. | rules unit tests (emulator): public read, authed-own create/update only; fork creates a new owned doc with attribution; edit blocked for non-owner |
 | **W3. App Link** | `recipeLink.ts` builds the `https://dsc.<domain>/r/:id?d=…` link; **"Add to Damn Simple Cooking"** button; `assetlinks.json` for App-Link verification + intent-filter parity with the app. | encode↔decode round-trip with the app's `recipe_link_codec`; link opens app and adds recipe (manual on-device) |
+| **W4. Stats (ratings + adds)** | `clientIp.ts` (IP-echo fetch → hashed `ipKey`, with fallback); `stats.ts` `rate()`/`recordAdd()`; denormalized `ratingSum`/`ratingCount`/`addCount`; `StarRating` + `StatsBadge`; Add button records an Add; **stat security rules** committed. | rules tests (emulator): anonymous one-rating/one-add per `ipKey`, `value∈1..5`, counter deltas constrained, stat writes can't mutate content; client avg compute; stars disable after rating |
 
 ---
 
@@ -344,6 +380,7 @@ Each phase is independently runnable/testable. **App v1 = Phases 1–6; Web v1 =
 - **Provider:** fake repo; search filtering; portion provider scales the derived list deterministically; ephemeral reset to ×1 on reopen.
 - **Widget:** home search; ⋮ → **Remove from app** deletes the local row only; steps screen renders ingredients-card-then-steps; slider + portion dialog both scale every row. (No editor exists in the app, so there are no in-app authoring/validation widget tests.)
 - **Web:** Firestore **security-rules tests** on the emulator (public read; authed users create/update only their own docs; **non-owner edit denied**; **fork creates a new owned doc** with `forkedFrom*` attribution); **form validation** (empty title / 0 ingredients / 0 steps blocked) lives here now; fork seeding pre-fills the form and records correct attribution; rational parity tests sharing the same fixtures as the app; encode↔decode round-trip between `recipeLink.ts` and `recipe_link_codec.dart`.
+- **Web stats:** rules tests for the anonymous path — one rating + one add per `ipKey` (re-create rejected), `value ∈ 1..5` enforced, counter deltas constrained to `+1`/`+value`, and a stat write **cannot** alter recipe content or `author*`; `clientIp.ts` falls back gracefully when the IP API fails; client-side average (`ratingSum/ratingCount`) renders correctly and stars disable after rating.
 - A fixed/injectable clock keeps any time-based tests deterministic (mirrors dss).
 
 ---
@@ -355,8 +392,9 @@ Each phase is independently runnable/testable. **App v1 = Phases 1–6; Web v1 =
 - Step ↔ ingredient references (e.g. tap a step to highlight ingredients used).
 - Fetch-by-id fallback for oversized recipes (app would then need a one-off network read — breaks pure-offline, so opt-in only).
 - Web: delete own recipes (edit & fork are now in v1); report/flag; pagination/full-text search; a fork tree/lineage view ("variations of this recipe").
+- **Stats hardening:** replace best-effort hashed-IP dedup with **Firebase Anonymous Auth** (enforceable one-per-uid in rules, no server) or a Cloud Function gate for true integrity; sorting/filtering browse by rating or popularity; a **distributed counter** if a single recipe ever exceeds Firestore's ~1 write/sec per-doc ceiling; surfacing stats in the app via a periodic opt-in refresh (would require network — opt-in only).
 - App: export/share a recipe back out as an App Link; categories/tags; iOS build & store packaging.
 
 ---
 
-_Decisions captured 2026-06-10. Amended 2026-06-13: authoring (create/edit) moved to web-only — the app is now read/cook-only with a Remove-from-app action and no editor; added recipe **forking** with attribution; all recipes are public. This plan is the source of truth; update it as scope evolves._
+_Decisions captured 2026-06-10. Amended 2026-06-13: (1) authoring (create/edit) moved to web-only — the app is now read/cook-only with a Remove-from-app action and no editor; (2) added recipe **forking** with attribution; all recipes are public; (3) added **web-only recipe stats** — anonymous 1–5 star ratings (avg + count) and an "Adds" counter, deduped best-effort by hashed IP, aggregated client-side with no Cloud Functions. This plan is the source of truth; update it as scope evolves._
